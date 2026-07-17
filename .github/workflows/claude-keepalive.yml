@@ -2,7 +2,7 @@ name: claude-keepalive
 
 on:
   schedule:
-    - cron: "0 3,12,17,22 * * *" # autogen
+    - cron: "30 2,11,16,21 * * *" # autogen
   workflow_dispatch: {}
 
 concurrency:
