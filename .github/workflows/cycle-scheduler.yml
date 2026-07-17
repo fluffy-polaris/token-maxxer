@@ -1,0 +1,58 @@
+name: cycle-scheduler
+
+on:
+  schedule:
+    - cron: "23 0 * * *"
+  push:
+    branches: [main]
+    paths: [".github/workflows/cycle-scheduler.yml"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  reschedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.KEEPALIVE_PAT }}
+
+      - name: Rewrite cron from vars
+        env:
+          TZ: ${{ vars.TZ }}
+          CYCLE_START_HOUR: ${{ vars.CYCLE_START_HOUR }}
+        run: |
+          hour="${CYCLE_START_HOUR:-0}"
+          if ! printf '%s' "$hour" | grep -qE '^([01]?[0-9]|2[0-3])(:[0-5][0-9])?$'; then
+            echo "::error::CYCLE_START_HOUR must be H or H:MM (0-23), got '$hour'"; exit 1
+          fi
+          b=$(date -d "$(date +%F) ${hour}:00" +%s)
+          m=$(date -u -d "@$b" +%-M)
+          hours=$(for i in 0 1 2 3; do date -u -d "@$(( b + i * 18000 ))" +%-H; done | sort -n | paste -sd, -)
+          sed -i "s|cron: \".*\" # autogen|cron: \"$m $hours * * *\" # autogen|" .github/workflows/claude-keepalive.yml
+
+      - name: Commit if changed
+        run: |
+          git config user.name "keepalive-bot"
+          git config user.email "keepalive-bot@users.noreply.github.com"
+          git add .github/workflows/claude-keepalive.yml
+          git diff --cached --quiet && exit 0
+          git commit -m "Reschedule cycle cron [skip ci]"
+          git push
+
+      - name: Token health check
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models \
+            -H "authorization: Bearer ${TOKEN}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: oauth-2025-04-20")
+          case "$code" in
+            200) echo "token alive" ;;
+            401|403) echo "::error::token dead (HTTP $code), regenerate CLAUDE_CODE_OAUTH_TOKEN via claude setup-token"; exit 1 ;;
+            *) echo "::warning::models check returned HTTP $code" ;;
+          esac

@@ -1,0 +1,76 @@
+name: claude-keepalive
+
+on:
+  schedule:
+    - cron: "0 3,12,17,22 * * *" # autogen
+  workflow_dispatch: {}
+
+concurrency:
+  group: claude-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Cycle gate
+        id: gate
+        env:
+          TZ: ${{ vars.TZ }}
+          CYCLE_START_HOUR: ${{ vars.CYCLE_START_HOUR }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          hour="${CYCLE_START_HOUR:-0}"
+          b=$(date -d "$(date +%F) ${hour}:00" +%s)
+          now=$(date +%s)
+          cycle=$(( (now - b) / 18000 ))
+          if [ "$now" -ge "$b" ] && [ "$cycle" -lt 4 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "in cycle $cycle, fire"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "outside active 20h span (cycle $cycle), skip"
+          fi
+
+      - name: Resolve latest CLI version
+        id: ver
+        if: steps.gate.outputs.run == 'true'
+        run: echo "v=$(npm view @anthropic-ai/claude-code version)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Claude CLI cache
+        id: cache
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: claude-cli-${{ steps.ver.outputs.v }}
+
+      - name: Install Claude CLI
+        if: steps.gate.outputs.run == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: npm install -g --prefix ~/.npm-global @anthropic-ai/claude-code@${{ steps.ver.outputs.v }}
+
+      - name: Add CLI to PATH
+        if: steps.gate.outputs.run == 'true'
+        run: echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Keep alive
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          for i in $(seq 1 8); do
+            if out=$(claude -p "." --model haiku --max-turns 1 --allowed-tools "" 2>&1); then
+              echo "sent on try $i"; exit 0
+            fi
+            last=$(printf '%s' "$out" | tail -1)
+            echo "try $i failed: $last"
+            if printf '%s' "$out" | grep -qiE 'usage limit|rate limit|429|quota|overage|out_of_credits'; then
+              echo "plan cap reached, nothing to retry this cycle"; exit 0
+            fi
+            sleep $(( i * 15 ))
+          done
+          echo "::error::keepalive ping failed after 8 tries"; exit 1
